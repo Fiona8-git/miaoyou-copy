@@ -1,0 +1,677 @@
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { Env, Mailbox } from './types';
+import { 
+  createMailbox, 
+  getMailbox, 
+  loginMailbox,
+  deleteMailbox, 
+  getEmails, 
+  getEmail, 
+  deleteEmail,
+  markEmailAsUnread,
+  getAttachments,
+  getAttachment,
+  getMailboxCount,
+  getMailboxCountByIpLast24h,
+  batchDeleteEmails,
+  batchMarkEmailsAsRead,
+  batchMarkEmailsAsUnread,
+  getMailboxId,
+  verifyMailboxPassword,
+  enforceRateLimit,
+  sendInternalMessage,
+  getChatMessages,
+  getChatConversations,
+  deleteInternalMessages,
+  markChatRead,
+  getUnreadChatCount
+} from './database';
+import { generateRandomAddress, generatePassword, isValidEmailAddress, extractMailboxName, getCurrentTimestamp } from './utils';
+
+// 创建 Hono 应用
+const app = new Hono<{ Bindings: Env }>();
+
+// 添加 CORS 中间件
+app.use('/*', cors({
+  origin: '*',
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type'],
+  maxAge: 86400,
+}));
+
+// 安全响应头中间件
+app.use('*', async (c, next) => {
+  await next();
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('X-Frame-Options', 'DENY');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('X-XSS-Protection', '0');
+});
+
+// 健康检查端点
+app.get('/', (c) => {
+  return c.json({ status: 'ok', message: '临时邮箱系统API正常运行' });
+});
+
+// 获取系统配置
+app.get('/api/config', (c) => {
+  try {
+    const emailDomains = c.env.VITE_EMAIL_DOMAIN || '';
+    const domains = emailDomains.split(',').map((domain: string) => domain.trim()).filter((domain: string) => domain);
+    
+    const externalLinksRaw = c.env.VITE_EXTERNAL_LINKS || '';
+    const externalLinks = externalLinksRaw.split(',').filter(Boolean).map((pair: string) => {
+      const [label, url] = pair.split('|');
+      return { label: label?.trim() || url, url: url?.trim() || '' };
+    }).filter((l: { url: string }) => l.url);
+    
+    return c.json({ 
+      success: true, 
+      config: {
+        emailDomains: domains,
+        externalLinks: externalLinks.length > 0 ? externalLinks : undefined
+      }
+    });
+  } catch (error) {
+    console.error('获取配置失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '获取配置失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 获取系统统计信息
+app.get('/api/stats', async (c) => {
+  try {
+    const count = await getMailboxCount(c.env.DB);
+    return c.json({ 
+      success: true, 
+      stats: {
+        mailboxCount: count
+      }
+    });
+  } catch (error) {
+    console.error('获取统计信息失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '获取统计信息失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+
+// 创建邮箱
+app.post('/api/mailboxes', async (c) => {
+  try {
+    const body = await c.req.json();
+    
+    // 验证参数
+    if (body.address && typeof body.address !== 'string') {
+      return c.json({ success: false, error: '无效的邮箱地址' }, 400);
+    }
+    if (body.password !== undefined && (typeof body.password !== 'string' || body.password.length < 6)) {
+      return c.json({ success: false, error: '密码长度至少需要 6 个字符' }, 400);
+    }
+    
+    const expiresInHours = 876000; // 100年，相当于永久
+    
+    // 获取客户端IP
+    const ip = c.req.header('CF-Connecting-IP') || 'unknown';
+    
+    // 检查 IP 频率限制：24小时内最多创建10个
+    if (ip !== 'unknown') {
+      const ipCount = await getMailboxCountByIpLast24h(c.env.DB, ip);
+      if (ipCount >= 10) {
+        return c.json({ success: false, error: '您的 IP 在 24 小时内创建邮箱数量已达上限 (10个)' }, 429);
+      }
+    }
+    
+    // 生成或使用提供的地址
+    const address = body.address || generateRandomAddress();
+    // 使用前端提供的密码，或生成随机密码
+    const password = body.password || generatePassword();
+    
+    // 检查邮箱是否已存在
+    const existingMailbox = await getMailbox(c.env.DB, address);
+    if (existingMailbox) {
+      return c.json({ success: false, error: '邮箱地址已存在' }, 400);
+    }
+    
+    // 创建邮箱
+    const mailbox = await createMailbox(c.env.DB, {
+      address,
+      password,
+      expiresInHours,
+      ipAddress: ip,
+    });
+    
+    return c.json({ success: true, mailbox, password });
+  } catch (error) {
+    console.error('创建邮箱失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '创建邮箱失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 400);
+  }
+});
+
+// 获取邮箱信息
+app.get('/api/mailboxes/:address', async (c) => {
+  try {
+    const address = c.req.param('address');
+    const mailbox = await getMailbox(c.env.DB, address);
+    
+    if (!mailbox) {
+      return c.json({ success: false, error: '邮箱不存在' }, 404);
+    }
+    
+    return c.json({ success: true, mailbox });
+  } catch (error) {
+    console.error('获取邮箱失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '获取邮箱失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 登录邮箱
+app.post('/api/mailboxes/login', async (c) => {
+  try {
+    const body = await c.req.json();
+    
+    // 验证参数
+    if (!body.address || !body.password) {
+      return c.json({ success: false, error: '邮箱地址和密码不能为空' }, 400);
+    }
+    
+    if (typeof body.address !== 'string' || typeof body.password !== 'string') {
+      return c.json({ success: false, error: '无效的参数' }, 400);
+    }
+    
+    // 尝试登录
+    const mailbox = await loginMailbox(c.env.DB, body.address, body.password);
+    
+    if (!mailbox) {
+      // 登录失败：按 IP 限流，防爆破
+      const ip = c.req.header('CF-Connecting-IP') || 'unknown';
+      if (ip !== 'unknown') {
+        const limited = await enforceRateLimit(c.env.DB, `login:${ip}`, 900, 10);
+        if (limited) {
+          return c.json({ success: false, error: '尝试次数过多，请 15 分钟后再试' }, 429);
+        }
+      }
+      return c.json({ success: false, error: '邮箱地址或密码错误' }, 401);
+    }
+    
+    return c.json({ success: true, mailbox });
+  } catch (error) {
+    console.error('登录失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '登录失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 删除邮箱
+app.delete('/api/mailboxes/:address', async (c) => {
+  try {
+    const address = c.req.param('address');
+    await deleteMailbox(c.env.DB, address);
+    
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('删除邮箱失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '删除邮箱失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 获取邮件列表
+app.get('/api/mailboxes/:address/emails', async (c) => {
+  try {
+    const address = c.req.param('address');
+    const mailbox = await getMailbox(c.env.DB, address);
+    
+    if (!mailbox) {
+      return c.json({ success: false, error: '邮箱不存在' }, 404);
+    }
+    
+    const emails = await getEmails(c.env.DB, mailbox.id);
+    
+    return c.json({ success: true, emails });
+  } catch (error) {
+    console.error('获取邮件列表失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '获取邮件列表失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 站内发信（发送站内消息给本站的另一邮箱）
+app.post('/api/mailboxes/:address/messages', async (c) => {
+  try {
+    const address = c.req.param('address').trim().toLowerCase();
+    const body = await c.req.json();
+
+    if (!body.toAddress || typeof body.toAddress !== 'string') {
+      return c.json({ success: false, error: '请填写收件人邮箱地址' }, 400);
+    }
+    if (!body.content || typeof body.content !== 'string' || !body.content.trim()) {
+      return c.json({ success: false, error: '消息内容不能为空' }, 400);
+    }
+
+    const content = body.content.trim();
+    if (content.length > 5000) {
+      return c.json({ success: false, error: '单条消息长度不能超过 5000 字符' }, 400);
+    }
+
+    const toAddress = body.toAddress.trim().toLowerCase();
+
+    if (!isValidEmailAddress(toAddress)) {
+      return c.json({ success: false, error: '收件人地址格式不正确' }, 400);
+    }
+
+    // 发件人必须是本站邮箱且通过密码鉴权（防止冒用他人地址发信）
+    if (!body.password || typeof body.password !== 'string') {
+      return c.json({ success: false, error: '需要密码鉴权后才能发送站内消息' }, 401);
+    }
+    const fromMailbox = await verifyMailboxPassword(c.env.DB, address, body.password);
+    if (!fromMailbox) {
+      return c.json({ success: false, error: '发件邮箱或密码错误' }, 401);
+    }
+
+    // 不能给自己发信
+    if (toAddress === address) {
+      return c.json({ success: false, error: '不能给自己发送站内消息' }, 400);
+    }
+
+    // 收件人必须在本站存在（站内发信）
+    const toMailboxId = await getMailboxId(c.env.DB, toAddress);
+    if (!toMailboxId) {
+      return c.json({ success: false, error: '对方邮箱不存在，请确认对方已在秒邮注册' }, 404);
+    }
+
+    // 按发件邮箱限流，防刷屏
+    const rateLimited = await enforceRateLimit(c.env.DB, `send:${address}`, 60, 30);
+    if (rateLimited) {
+      return c.json({ success: false, error: '发送过于频繁，请稍后再试' }, 429);
+    }
+
+    const fromName = extractMailboxName(address);
+    const toMailbox = { id: toMailboxId, address: toAddress } as Mailbox;
+    await sendInternalMessage(c.env.DB, fromMailbox, toMailbox, fromName, content);
+
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('站内发信失败:', error);
+    return c.json({
+      success: false,
+      error: '站内发信失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 获取与对方的站内对话（增量轮询，降低 D1 读取量）
+app.get('/api/mailboxes/:address/chat', async (c) => {
+  try {
+    const address = c.req.param('address').trim().toLowerCase();
+    const withAddress = (c.req.query('with') || '').trim().toLowerCase();
+    const since = Number(c.req.query('since')) || 0;
+    // 导出时允许拉取全部历史，上限放宽到 5000
+    const limit = Math.min(Number(c.req.query('limit')) || 30, 5000);
+
+    if (!withAddress || !isValidEmailAddress(withAddress)) {
+      return c.json({ success: false, error: '缺少有效的对方邮箱地址' }, 400);
+    }
+
+    const mailboxId = await getMailboxId(c.env.DB, address);
+    if (!mailboxId) {
+      return c.json({ success: false, error: '邮箱不存在' }, 404);
+    }
+
+    const peerAddress = withAddress;
+    const messages = await getChatMessages(c.env.DB, mailboxId, peerAddress, since, limit);
+
+    // 打开/轮询聊天时，把对方发给我的消息标记为已读，角标清零
+    await markChatRead(c.env.DB, mailboxId, peerAddress);
+
+    return c.json({ success: true, messages });
+  } catch (error) {
+    console.error('获取站内对话失败:', error);
+    return c.json({
+      success: false,
+      error: '获取站内对话失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 获取当前邮箱的站内会话列表（谁发来、发了什么、几条未读）
+app.get('/api/mailboxes/:address/chat/conversations', async (c) => {
+  try {
+    const address = c.req.param('address').trim().toLowerCase();
+    const mailboxId = await getMailboxId(c.env.DB, address);
+    if (!mailboxId) {
+      return c.json({ success: false, error: '邮箱不存在' }, 404);
+    }
+    const conversations = await getChatConversations(c.env.DB, mailboxId, address);
+    return c.json({ success: true, conversations });
+  } catch (error) {
+    console.error('获取站内会话列表失败:', error);
+    return c.json({
+      success: false,
+      error: '获取站内会话列表失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 获取当前邮箱未读站内消息数量（用于导航角标与首页提示条）
+app.get('/api/mailboxes/:address/chat/unread', async (c) => {
+  try {
+    const address = c.req.param('address').trim().toLowerCase();
+    const mailboxId = await getMailboxId(c.env.DB, address);
+    if (!mailboxId) {
+      return c.json({ success: false, error: '邮箱不存在' }, 404);
+    }
+    const count = await getUnreadChatCount(c.env.DB, mailboxId);
+    return c.json({ success: true, count });
+  } catch (error) {
+    console.error('获取未读站内消息数失败:', error);
+    return c.json({
+      success: false,
+      error: '获取未读站内消息数失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 清空与某用户的站内聊天记录（按小时，双方副本一并删除）
+app.delete('/api/mailboxes/:address/chat', async (c) => {
+  try {
+    const address = c.req.param('address').trim().toLowerCase();
+    const withAddress = (c.req.query('with') || '').trim().toLowerCase();
+    const hours = Number(c.req.query('hours')) || 0;
+
+    if (!withAddress || !isValidEmailAddress(withAddress)) {
+      return c.json({ success: false, error: '缺少有效的对方邮箱地址' }, 400);
+    }
+
+    // 双方邮箱都必须存在
+    const myId = await getMailboxId(c.env.DB, address);
+    const peerId = await getMailboxId(c.env.DB, withAddress);
+    if (!myId || !peerId) {
+      return c.json({ success: false, error: '邮箱不存在' }, 404);
+    }
+
+    // hours > 0 表示仅清空最近 N 小时；0 表示清空全部
+    const afterTs = hours > 0 ? getCurrentTimestamp() - hours * 3600 : 0;
+    const deleted = await deleteInternalMessages(c.env.DB, myId, address, peerId, withAddress, afterTs);
+
+    return c.json({ success: true, deleted });
+  } catch (error) {
+    console.error('清空站内聊天记录失败:', error);
+    return c.json({
+      success: false,
+      error: '清空站内聊天记录失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 获取邮件详情
+app.get('/api/emails/:id', async (c) => {
+  try {
+    const id = c.req.param('id');
+    const email = await getEmail(c.env.DB, id);
+    
+    if (!email) {
+      return c.json({ success: false, error: '邮件不存在' }, 404);
+    }
+    
+    return c.json({ success: true, email });
+  } catch (error) {
+    console.error('获取邮件详情失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '获取邮件详情失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 获取邮件的附件列表
+app.get('/api/emails/:id/attachments', async (c) => {
+  try {
+    const id = c.req.param('id');
+    
+    // 检查邮件是否存在
+    const email = await getEmail(c.env.DB, id);
+    if (!email) {
+      return c.json({ success: false, error: '邮件不存在' }, 404);
+    }
+    
+    // 获取附件列表
+    const attachments = await getAttachments(c.env.DB, id);
+    
+    return c.json({ success: true, attachments });
+  } catch (error) {
+    console.error('获取附件列表失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '获取附件列表失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 获取附件详情
+app.get('/api/attachments/:id', async (c) => {
+  try {
+    const id = c.req.param('id');
+    const attachment = await getAttachment(c.env.DB, id);
+    
+    if (!attachment) {
+      return c.json({ success: false, error: '附件不存在' }, 404);
+    }
+    
+    // 检查是否需要直接返回附件内容
+    const download = c.req.query('download') === 'true';
+    
+    if (download) {
+      // 将Base64内容转换为二进制
+      const binaryContent = atob(attachment.content);
+      const bytes = new Uint8Array(binaryContent.length);
+      for (let i = 0; i < binaryContent.length; i++) {
+        bytes[i] = binaryContent.charCodeAt(i);
+      }
+      
+      // 设置响应头
+      c.header('Content-Type', attachment.mimeType);
+      c.header('Content-Disposition', `attachment; filename="${encodeURIComponent(attachment.filename)}"`);
+      
+      return c.body(bytes);
+    }
+    
+    // 返回附件信息（不包含内容，避免响应过大）
+    return c.json({ 
+      success: true, 
+      attachment: {
+        id: attachment.id,
+        emailId: attachment.emailId,
+        filename: attachment.filename,
+        mimeType: attachment.mimeType,
+        size: attachment.size,
+        createdAt: attachment.createdAt,
+        isLarge: attachment.isLarge,
+        chunksCount: attachment.chunksCount
+      }
+    });
+  } catch (error) {
+    console.error('获取附件详情失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '获取附件详情失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// AI 聊天
+app.post('/api/chat', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { message, history = [], systemPrompt, max_tokens } = body;
+
+    if (!message?.trim()) {
+      return c.json({ success: false, error: '消息不能为空' }, 400);
+    }
+
+    const messages = [
+      { role: 'system', content: systemPrompt || '你是一个友好、聪明、有帮助的AI助手。请用中文回复用户的问题。' },
+      ...history.slice(-12),
+      { role: 'user', content: message }
+    ];
+
+    const aiResponse = await c.env.AI.run(
+      '@cf/meta/llama-4-scout-17b-16e-instruct',
+      {
+        messages,
+        temperature: 0.75,
+        max_tokens: max_tokens || 800,
+        stream: true
+      }
+    );
+
+    return new Response(aiResponse, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      }
+    });
+  } catch (error) {
+    console.error('AI 调用错误:', error);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
+  }
+});
+
+// 删除邮件
+app.delete('/api/emails/:id', async (c) => {
+  try {
+    const id = c.req.param('id');
+    await deleteEmail(c.env.DB, id);
+    
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('删除邮件失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '删除邮件失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 将邮件标记为未读
+app.put('/api/emails/:id/unread', async (c) => {
+  try {
+    const id = c.req.param('id');
+    await markEmailAsUnread(c.env.DB, id);
+    
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('标记邮件为未读失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '标记邮件为未读失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 批量删除邮件
+app.post('/api/emails/batch/delete', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { emailIds } = body;
+    
+    if (!Array.isArray(emailIds) || emailIds.length === 0) {
+      return c.json({ success: false, error: '请提供要删除的邮件ID列表' }, 400);
+    }
+    
+    await batchDeleteEmails(c.env.DB, emailIds);
+    
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('批量删除邮件失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '批量删除邮件失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 批量标记邮件为已读
+app.post('/api/emails/batch/read', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { emailIds } = body;
+    
+    if (!Array.isArray(emailIds) || emailIds.length === 0) {
+      return c.json({ success: false, error: '请提供要标记的邮件ID列表' }, 400);
+    }
+    
+    await batchMarkEmailsAsRead(c.env.DB, emailIds);
+    
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('批量标记邮件为已读失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '批量标记邮件为已读失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+// 批量标记邮件为未读
+app.post('/api/emails/batch/unread', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { emailIds } = body;
+    
+    if (!Array.isArray(emailIds) || emailIds.length === 0) {
+      return c.json({ success: false, error: '请提供要标记的邮件ID列表' }, 400);
+    }
+    
+    await batchMarkEmailsAsUnread(c.env.DB, emailIds);
+    
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('批量标记邮件为未读失败:', error);
+    return c.json({ 
+      success: false, 
+      error: '批量标记邮件为未读失败',
+      message: error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
+});
+
+export default app;
